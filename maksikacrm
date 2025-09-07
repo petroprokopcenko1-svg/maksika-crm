@@ -1,0 +1,194 @@
+from typing import Optional
+from datetime import datetime, timedelta
+
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from sqlmodel import SQLModel, Field, Session, create_engine, select
+from passlib.context import CryptContext
+from jose import jwt, JWTError
+
+app = FastAPI(
+    title="Максіка CRM",
+    version="0.1.0"
+)
+
+
+# ---------------- DB ----------------
+DB_URL = "sqlite:///./db.sqlite3"
+engine = create_engine(DB_URL, echo=False)
+
+
+# ---------------- Security ----------------
+SECRET_KEY = "change_me"          # заміни на випадковий рядок
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 1 день
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")  # показує кнопку Authorize у Swagger
+
+
+# ---------------- Models ----------------
+class User(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    email: str = Field(index=True, unique=True)
+    hashed_password: str
+
+
+class Offer(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    geo: str
+    price: float
+
+
+class Lead(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    phone: str
+    geo: str
+    offer_id: int = Field(foreign_key="offer.id")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ---------------- Schemas ----------------
+from pydantic import BaseModel
+
+
+class LoginData(BaseModel):
+    email: str
+    password: str
+
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+# ---------------- Helpers ----------------
+def create_db_and_seed():
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as s:
+        # seed admin
+        existing = s.exec(select(User).where(User.email == "admin@local")).first()
+        if not existing:
+            admin = User(email="admin@local", hashed_password=pwd_context.hash("admin123"))
+            s.add(admin)
+            s.commit()
+
+
+def authenticate(email: str, password: str) -> Optional[User]:
+    with Session(engine) as s:
+        user = s.exec(select(User).where(User.email == email)).first()
+        if not user:
+            return None
+        if not pwd_context.verify(password, user.hashed_password):
+            return None
+        return user
+
+
+def create_token(sub_email: str) -> str:
+    payload = {"sub": sub_email, "exp": datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)}
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+        if email is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        with Session(engine) as s:
+            user = s.exec(select(User).where(User.email == email)).first()
+            if not user:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+            return user
+    except JWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token error")
+
+
+# ---------------- Startup ----------------
+@app.on_event("startup")
+def on_startup():
+    create_db_and_seed()
+
+
+# ---------------- Routes ----------------
+@app.get("/health", tags=["default"])
+def health():
+    return {"status": "ok"}
+
+
+# ---- AUTH ----
+@app.post("/auth/login", response_model=TokenOut, tags=["auth"])
+def login(data: LoginData):
+    user = authenticate(data.email, data.password)
+    if not user:
+        raise HTTPException(status_code=400, detail="Incorrect email or password")
+    token = create_token(user.email)
+    return {"access_token": token, "token_type": "bearer"}
+
+
+# ---- OFFERS ----
+@app.post("/offers", tags=["offers"])
+def create_offer(offer: Offer, _: User = Depends(get_current_user)):
+    with Session(engine) as s:
+        s.add(offer)
+        s.commit()
+        s.refresh(offer)
+        return offer
+
+
+@app.get("/offers", tags=["offers"])
+def list_offers(_: User = Depends(get_current_user)):
+    with Session(engine) as s:
+        return s.exec(select(Offer)).all()
+
+
+# ---- LEADS ----
+@app.post("/leads", tags=["leads"])
+def create_lead(lead: Lead, _: User = Depends(get_current_user)):
+    with Session(engine) as s:
+        s.add(lead)
+        s.commit()
+        s.refresh(lead)
+        return lead
+
+
+@app.get("/leads", tags=["leads"])
+def list_leads(_: User = Depends(get_current_user)):
+    with Session(engine) as s:
+        return s.exec(select(Lead)).all()
+
+# 🚀 Ethical CRM (FastAPI) — Full
+
+## Як запустити
+1) Активуй середовище (Windows cmd):
+```
+venv\Scripts\activate.bat
+```
+2) Встанови залежності (разово):
+```
+pip install -r requirements.txt
+```
+3) Запуск:
+```
+uvicorn main:app --reload --port 4000
+```
+4) Відкрий: http://127.0.0.1:4000/docs
+
+## Як авторизуватись у Swagger
+- Відкрий **POST /auth/login** → **Try it out** → тіло:
+```json
+{
+  "email": "admin@local",
+  "password": "admin123"
+}
+```
+- Скопіюй `access_token` з відповіді.
+- Угорі натисни **Authorize** → у полі *OAuth2PasswordBearer* встав токен (без слова `Bearer`).
+- Тепер ендпоінти `/offers` і `/leads` будуть працювати.
+
+fastapi
+uvicorn
+sqlmodel
+passlib[bcrypt]
+python-jose
